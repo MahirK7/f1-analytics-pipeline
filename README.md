@@ -101,8 +101,3 @@ Enrich dashboards with pit stop strategies & weather data
 
 Cloud deployment (AWS/GCP/Azure)
 
-📌 Author
-
-👤 Mahir Kardame
-🔗 LinkedIn
- | GitHub
