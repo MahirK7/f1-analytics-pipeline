@@ -1,0 +1,266 @@
+version: "3.9"
+
+services:
+  # ==========================
+  #     WAREHOUSE: MySQL
+  # ==========================
+  mysql:
+    image: mysql:8.0
+    container_name: f1-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DB}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    command: ["--default-authentication-plugin=mysql_native_password"]
+    ports:
+      - "${MYSQL_PORT}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -uroot -p${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  phpmyadmin:
+    image: phpmyadmin:5
+    container_name: f1-phpmyadmin
+    restart: unless-stopped
+    environment:
+      PMA_HOST: f1-mysql
+      PMA_USER: ${MYSQL_USER}
+      PMA_PASSWORD: ${MYSQL_PASSWORD}
+    ports:
+      - "${PHPMYADMIN_PORT}:80"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  # ==========================
+  #       AIRFLOW META DB
+  # ==========================
+  airflow-db:
+    image: postgres:15
+    container_name: f1-airflow-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_pg:/var/lib/postgresql/data
+
+  # ==========================
+  #          AIRFLOW
+  # ==========================
+  airflow-init:
+    build: .
+    container_name: f1-airflow-init
+    depends_on:
+      - airflow-db
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+      _AIRFLOW_DB_UPGRADE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+      _AIRFLOW_WWW_USER_EMAIL: ${AIRFLOW_ADMIN_EMAIL}
+    entrypoint: /bin/bash
+    command: -c "airflow db upgrade && \
+                 airflow users create \
+                  --username ${AIRFLOW_ADMIN_USER} \
+                  --password ${AIRFLOW_ADMIN_PASSWORD} \
+                  --firstname A --lastname B \
+                  --role Admin \
+                  --email ${AIRFLOW_ADMIN_EMAIL} || true"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./sql:/opt/airflow/sql
+
+  airflow-webserver:
+    build: .
+    container_name: f1-airflow-web
+    restart: unless-stopped
+    ports:
+      - "${AIRFLOW_UI_PORT}:8080"
+    depends_on:
+      - airflow-db
+      - airflow-init
+      - mysql
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+      F1_MYSQL_URI: ${F1_MYSQL_URI}
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./fastf1_cache:/opt/airflow/fastf1_cache
+      - ./logs:/opt/airflow/logs
+      - ./sql:/opt/airflow/sql
+    command: ["airflow", "webserver"]
+
+  airflow-scheduler:
+    build: .
+    container_name: f1-airflow-scheduler
+    restart: unless-stopped
+    depends_on:
+      - airflow-db
+      - airflow-init
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+      F1_MYSQL_URI: ${F1_MYSQL_URI}
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./fastf1_cache:/opt/airflow/fastf1_cache
+      - ./logs:/opt/airflow/logs
+      - ./sql:/opt/airflow/sql
+    command: ["airflow", "scheduler"]
+
+  airflow-triggerer:
+    build: .
+    container_name: f1-airflow-triggerer
+    restart: unless-stopped
+    depends_on:
+      - airflow-db
+      - airflow-init
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+      F1_MYSQL_URI: ${F1_MYSQL_URI}
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./fastf1_cache:/opt/airflow/fastf1_cache
+      - ./logs:/opt/airflow/logs
+      - ./sql:/opt/airflow/sql
+    command: ["airflow", "triggerer"]
+
+  # ==========================
+  #           KAFKA
+  # ==========================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.3
+    container_name: f1-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: ${ZOOKEEPER_PORT}
+    ports:
+      - "${ZOOKEEPER_PORT}:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.3
+    container_name: f1-kafka
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:${ZOOKEEPER_PORT}
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:${KAFKA_PORT}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    ports:
+      - "${KAFKA_PORT}:9092"
+
+  # ==========================
+  #            SPARK
+  # ==========================
+  spark:
+    image: bitnami/spark:3.5
+    container_name: f1-spark
+    restart: unless-stopped
+    environment:
+      SPARK_MODE: master
+    ports:
+      - "7077:7077"
+      - "${SPARK_UI_PORT}:8080"
+    volumes:
+      - ./spark:/opt/spark/work
+
+  # ==========================
+  #           AIRBYTE
+  # ==========================
+  airbyte-db:
+    image: postgres:15
+    container_name: f1-airbyte-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: airbyte
+      POSTGRES_PASSWORD: airbyte
+      POSTGRES_DB: airbyte
+    volumes:
+      - airbyte_pg:/var/lib/postgresql/data
+
+  airbyte-temporal:
+    image: temporalio/auto-setup:1.21.2
+    container_name: f1-airbyte-temporal
+    restart: unless-stopped
+    environment:
+      DB: postgresql
+      DB_PORT: 5432
+      POSTGRES_USER: airbyte
+      POSTGRES_PWD: airbyte
+      POSTGRES_SEEDS: airbyte-db
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development.yaml
+    depends_on:
+      - airbyte-db
+
+  airbyte-server:
+    image: airbyte/server:0.50.49
+    container_name: f1-airbyte-server
+    restart: unless-stopped
+    depends_on:
+      - airbyte-db
+      - airbyte-temporal
+    environment:
+      DATABASE_USER: airbyte
+      DATABASE_PASSWORD: airbyte
+      DATABASE_URL: jdbc:postgresql://airbyte-db:5432/airbyte
+      CONFIG_DATABASE_USER: airbyte
+      CONFIG_DATABASE_PASSWORD: airbyte
+      CONFIG_DATABASE_URL: jdbc:postgresql://airbyte-db:5432/airbyte
+    ports:
+      - "8001:8001"
+
+  airbyte-worker:
+    image: airbyte/worker:0.50.49
+    container_name: f1-airbyte-worker
+    restart: unless-stopped
+    depends_on:
+      - airbyte-server
+      - airbyte-temporal
+    environment:
+      AIRBYTE_VERSION: 0.50.49
+      DATABASE_USER: airbyte
+      DATABASE_PASSWORD: airbyte
+      DATABASE_URL: jdbc:postgresql://airbyte-db:5432/airbyte
+      CONFIG_DATABASE_USER: airbyte
+      CONFIG_DATABASE_PASSWORD: airbyte
+      CONFIG_DATABASE_URL: jdbc:postgresql://airbyte-db:5432/airbyte
+      WORKSPACE_ROOT: /tmp/workspace
+      LOCAL_DOCKER_MOUNT: /tmp/airbyte_local
+      LOCAL_ROOT: /tmp/airbyte_local
+    volumes:
+      - /tmp/airbyte_local:/tmp/airbyte_local
+      - /tmp/workspace:/tmp/workspace
+      - airbyte_data:/data
+
+  airbyte-webapp:
+    image: airbyte/webapp:0.50.49
+    container_name: f1-airbyte-web
+    restart: unless-stopped
+    depends_on:
+      - airbyte-server
+    environment:
+      INTERNAL_API_HOST: airbyte-server:8001
+      CONNECTOR_BUILDER_API_HOST: airbyte-server:8001
+    ports:
+      - "${AIRBYTE_WEBAPP_PORT}:80"
+
+volumes:
+  mysql_data:
+  airflow_pg:
+  airbyte_pg:
+  airbyte_data:
